@@ -36,7 +36,7 @@ face-recognition-tool/
 
 ### 1️. Clone the repo
 
-git clone https://github.com/<akshitjindal77>/face-recognition-tool.git
+git clone https://github.com/akshitjindal77/face-recognition-tool.git
 cd face-recognition-tool
 ### 2️. Create a virtual environment
 Using conda (recommended)
@@ -56,11 +56,9 @@ pip install onnxruntime-gpu
 ### Option 1 — CLI (Command Line)
  1. Register a user
         python main.py register --name Akshit --cpu
- 2.  Build database
-        python main.py build-db --cpu
- 3.  Train SVM (optional, improves accuracy)
+ 2.  Train SVM (optional, improves accuracy)
         python main.py train-svm
- 4. Start live recognition
+ 3. Start live recognition
         python main.py recognize --cpu
  - Use --cpu for CPU mode or omit it to use GPU (if available).
  - Adjust unknown threshold with --thresh, e.g. --thresh 0.65.
@@ -105,11 +103,7 @@ These files are ignored by Git (.gitignore) to keep your repo clean and privacy-
 Install Microsoft Build Tools →
 Select “Desktop development with C++” workload → Restart → Reinstall InsightFace.
 
-2. "No users found / DB empty"
-Make sure you registered users before building the database.
-If still empty, check the Data directory path shown at the top of the Streamlit UI.
-
-3. "Recognition too strict / too loose"
+2. "Recognition too strict / too loose"
 Adjust Unknown threshold:
 Higher = fewer false positives (more Unknowns)
 Lower = fewer Unknowns but may misclassify
@@ -121,4 +115,5 @@ You may freely use, modify, and distribute this project for non-commercial or ed
 
 ## Credits
 Developed by Akshit Jindal
+
 Powered by InsightFace, OpenCV, and Streamlit

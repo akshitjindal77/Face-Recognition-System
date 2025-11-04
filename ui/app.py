@@ -1,7 +1,3 @@
-# app_ui.py
-# Streamlit UI for multi-user face registration & recognition (InsightFace backend)
-# Run: streamlit run app_ui.py
-
 import os, time, glob, pickle
 from pathlib import Path
 
@@ -14,12 +10,11 @@ import joblib
 from insightface.app import FaceAnalysis
 
 # -------------------- Config & paths --------------------
-from pathlib import Path
 BASE_DIR  = Path(__file__).parent.resolve()
-DATA_DIR   = Path("data")
-USERS_DIR  = DATA_DIR / "users"
-DB_FILE    = DATA_DIR / "insightface_db.pkl"     # new DB format (stores all_encodings + mean)
-SVM_FILE   = DATA_DIR / "svm_insightface.pkl"    # optional trained classifier
+DATA_DIR  = BASE_DIR / "data"
+USERS_DIR = DATA_DIR / "users"
+DB_FILE   = DATA_DIR / "insightface_db.pkl"     # new DB format (stores all_encodings + mean)
+SVM_FILE  = DATA_DIR / "svm_insightface.pkl"    # optional trained classifier
 MODEL_PACK = "buffalo_l"
 DET_SIZE   = (640, 640)
 
@@ -88,7 +83,6 @@ def build_database(app: FaceAnalysis):
     for udir in user_dirs:
         name = udir.name
         all_vecs = []
-        # accept common image extensions
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
             for img_path in udir.glob(ext):
                 img = cv2.imread(str(img_path))
@@ -96,16 +90,14 @@ def build_database(app: FaceAnalysis):
                     continue
                 faces = app.get(img)
                 if len(faces) != 1:
-                # retry on a slightly larger view (helps on tight crops)
+                    # retry on a slightly larger view (helps on tight crops)
                     h, w = img.shape[:2]
                     scale = 800 / max(h, w)
-                    if scale > 1.0:  # only upscale small images
+                    if scale > 1.0:
                         img_big = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
                         faces = app.get(img_big)
-                        # if we detect on the upscaled version, keep using that
                         if len(faces) == 1:
                             img = img_big
-                # Keep clean: only 1 face per enrollment image
                 if len(faces) != 1:
                     continue
                 emb = faces[0].normed_embedding
@@ -114,8 +106,8 @@ def build_database(app: FaceAnalysis):
                 all_vecs.append(emb.astype(np.float32))
                 total += 1
         if all_vecs:
-            arr = np.vstack(all_vecs)              # (N,512)
-            mean_vec = arr.mean(axis=0)            # (512,)
+            arr = np.vstack(all_vecs)
+            mean_vec = arr.mean(axis=0)
             db[name] = {
                 "all_encodings": all_vecs,
                 "embedding": mean_vec,
@@ -124,11 +116,51 @@ def build_database(app: FaceAnalysis):
     save_db(db)
     return db, total
 
+def update_user_in_db(app: FaceAnalysis, user_name: str):
+    """
+    After registering a user, compute their embeddings and update the DB immediately.
+    """
+    udir = USERS_DIR / user_name
+    if not udir.is_dir():
+        st.warning(f"No folder found for user {user_name}")
+        return
+
+    db = load_db()
+    all_vecs = []
+    total = 0
+
+    for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
+        for img_path in udir.glob(ext):
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+            faces = app.get(img)
+            if len(faces) != 1:
+                continue
+            emb = faces[0].normed_embedding
+            if emb is None or emb.size == 0:
+                continue
+            all_vecs.append(emb.astype(np.float32))
+            total += 1
+
+    if all_vecs:
+        arr = np.vstack(all_vecs)
+        mean_vec = arr.mean(axis=0)
+        db[user_name] = {
+            "all_encodings": all_vecs,
+            "embedding": mean_vec,
+            "count": len(all_vecs),
+        }
+        save_db(db)
+        st.success(f"✅ Database updated automatically for '{user_name}' ({len(all_vecs)} images).")
+    else:
+        st.warning(f"No valid faces found for '{user_name}'. Try re-registering.")
+
 # -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="Face ID (InsightFace)", layout="centered")
 st.title("Face Recognition Demo (InsightFace)")
 st.caption(f"Data directory: {DATA_DIR}")
-st.caption("Register users → Build database → Recognize in real time (local only)")
+st.caption("Register users → Database updates automatically → Recognize in real time")
 
 with st.sidebar:
     st.header("Controls")
@@ -136,38 +168,35 @@ with st.sidebar:
     use_cpu = st.checkbox("Force CPU (uncheck for GPU if available)", value=True)
     ctx_id = -1 if use_cpu else 0
 
-    # Threshold behaves as:
-    # - If SVM present: probability threshold (higher = stricter)
-    # - Else (cosine): similarity threshold (higher = stricter)
     thresh = st.slider("Unknown threshold", 0.40, 0.90, 0.60, 0.01)
-
     shots = st.number_input("Shots per registration", 4, 60, 40, 1)
     delay = st.slider("Delay between shots (sec)", 0.05, 1.0, 0.25, 0.05)
 
     st.divider()
     # DB actions
-    if st.button("Rebuild Database (compute embeddings)"):
+    if st.button("Rebuild All (optional)"):
         face_app = load_face_app(ctx_id)
-        with st.spinner("Building database..."):
+        with st.spinner("Rebuilding database..."):
             db, total = build_database(face_app)
         st.success(f"DB rebuilt: {len(db)} users, {total} images. File: {DB_FILE}")
+
     users = list_users()
     if st.button("Show Users"):
         if not users:
             st.info("No users yet")
-    else:
-        lines = []
-        for u in users:
-            cnt = sum(1 for _ in (USERS_DIR / u).glob("*.*"))
-            lines.append(f"{u}  —  {cnt} files")
-        st.info("\n".join(lines))
+        else:
+            lines = []
+            for u in users:
+                cnt = sum(1 for _ in (USERS_DIR / u).glob("*.*"))
+                lines.append(f"{u}  —  {cnt} files")
+            st.info("\n".join(lines))
 
-tab1, tab2, tab3 = st.tabs(["Register", "Build DB", "Recognize"])
+tab1, tab2, tab3 = st.tabs(["Register", "Database (optional)", "Recognize"])
 
 # ------------- Tab 1: Register -------------
 with tab1:
     st.subheader("Register a new user")
-    colA, colB = st.columns([2,1])
+    colA, colB = st.columns([2, 1])
     with colA:
         name = st.text_input("User name (folder-safe)", key="reg_name", placeholder="e.g., Akshit")
     with colB:
@@ -210,7 +239,6 @@ with tab1:
                         draw_label(frame, f"Capturing {taken+1}/{shots}", x1, y1 - 10)
 
                         if (time.time() - last) >= delay:
-                            # Save a slightly padded crop for inspection
                             pad = 40
                             h, w = frame.shape[:2]
                             px1 = max(0, x1 - pad); py1 = max(0, y1 - pad)
@@ -226,18 +254,23 @@ with tab1:
                     ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
 
                 cap.release()
-                status.success(f"Saved {taken} images to {user_dir}. Go to 'Build DB' tab next.")
+                if taken > 0:
+                    status.success(f"Saved {taken} images to {user_dir}. Updating database automatically...")
+                    with st.spinner("Computing embeddings and updating database..."):
+                        update_user_in_db(face_app, name.strip())
+                else:
+                    status.warning("No images captured. Database not updated.")
 
-# ------------- Tab 2: Build DB -------------
+# ------------- Tab 2: Database (optional) -------------
 with tab2:
-    st.subheader("Build / Update Database")
-    st.write("This step computes and saves per-image embeddings and an averaged embedding per user.")
-    if st.button("Build Now", key="build_now"):
+    st.subheader("Rebuild / Inspect Database")
+    st.write("Automatic updates happen after each registration. Use this only to rebuild all users.")
+    if st.button("Rebuild Database Now", key="build_now"):
         face_app = load_face_app(ctx_id)
         with st.spinner("Building database..."):
             db, total = build_database(face_app)
-        st.success(f"DB built: {len(db)} users, {total} images. File: {DB_FILE}")
-    st.caption("Tip: Rebuild after adding or deleting users.")
+        st.success(f"DB rebuilt: {len(db)} users, {total} images. File: {DB_FILE}")
+    st.caption("Tip: Use if you've manually deleted or moved user folders.")
 
 # ------------- Tab 3: Recognize -------------
 with tab3:
@@ -262,13 +295,11 @@ with tab3:
     if st.session_state.recognizing:
         db = load_db()
         if not db:
-            st.error("No database found. Build it in the 'Build DB' tab.")
+            st.error("No database found. Build it in the 'Database' tab.")
         else:
-            # Prepare fallback centroids
             names = list(db.keys())
             centroids = np.stack([db[n]["embedding"] for n in names], axis=0) if names else None
 
-            # Try loading SVM (optional)
             clf = None
             classes = None
             if SVM_FILE.exists():
@@ -300,21 +331,19 @@ with tab3:
 
                         if emb is not None and emb.size > 0:
                             if clf is not None:
-                                # SVM probability gating
                                 probs = clf.predict_proba([emb])[0]
                                 best_idx = int(np.argmax(probs))
                                 score = float(probs[best_idx])
                                 pred = classes[best_idx] if score >= thresh else "Unknown"
                                 label = pred
-                                color = (0,255,0) if pred != "Unknown" else (0,0,255)
+                                color = (0, 255, 0) if pred != "Unknown" else (0, 0, 255)
                             elif centroids is not None and len(names) > 0:
-                                # Cosine similarity to user means
                                 sims = cosine_sim_matrix(centroids, emb)
                                 best_idx = int(np.argmax(sims))
                                 score = float(sims[best_idx])
                                 pred = names[best_idx] if score >= thresh else "Unknown"
                                 label = pred
-                                color = (0,255,0) if pred != "Unknown" else (0,0,255)
+                                color = (0, 255, 0) if pred != "Unknown" else (0, 0, 255)
 
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                         draw_label(frame, f"{label} ({score:.2f})", x1, y1 - 10, color)

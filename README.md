@@ -5,7 +5,7 @@ It lets you register faces, build an embedding database, train an optional class
 
 ---
 
-## 🚀 Features
+## Features
 **Register new users** via webcam  
 **Build & save face embeddings** using InsightFace (ArcFace 512-D)  
 **Optional SVM training** for higher accuracy and probability-based “Unknown” detection  
@@ -16,7 +16,7 @@ It lets you register faces, build an embedding database, train an optional class
 
 ---
 
-## 🧩 Project Structure
+## Project Structure
 
 face-recognition-tool/
 ├─ ui/
@@ -32,7 +32,7 @@ face-recognition-tool/
 
 ---
 
-## ⚙️ Installation
+## Installation
 
 ### 1️. Clone the repo
 

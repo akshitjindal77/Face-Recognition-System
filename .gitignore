@@ -1,0 +1,35 @@
+# Envs
+.venv/
+venv/
+env/
+.myenv/
+myenv/
+conda-env/
+*.conda
+*.env
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# App data / artifacts
+data/users/
+data/*.pkl
+outputs/
+logs/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Model caches (InsightFace, ONNX, etc.)
+.insightface/
+~/.insightface/
+~/.cache/

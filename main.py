@@ -5,20 +5,17 @@ import os, cv2, time, pickle, argparse, glob
 import numpy as np
 import joblib
 
-# --- New imports (InsightFace + SVM) ---
 from insightface.app import FaceAnalysis
 from sklearn.svm import LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.cluster import KMeans  
 
-# -------------------------
-# Paths / constants
-# -------------------------
 DATA_DIR   = os.path.join("data")
 USERS_DIR  = os.path.join(DATA_DIR, "users")
 DB_FILE    = os.path.join(DATA_DIR, "insightface_db.pkl")
 SVM_FILE   = os.path.join(DATA_DIR, "svm_insightface.pkl")
-MODEL_PACK = "buffalo_l"          
-DET_SIZE   = (640, 640)           
+MODEL_PACK = "buffalo_l"
+DET_SIZE   = (640, 640)
 os.makedirs(USERS_DIR, exist_ok=True)
 
 def _draw_label(frame, text, x, y, color=(0,255,0)):
@@ -28,6 +25,27 @@ def _load_app(ctx_id=0):
     app = FaceAnalysis(name=MODEL_PACK)
     app.prepare(ctx_id=ctx_id, det_size=DET_SIZE)
     return app
+
+def _embed_image(app: FaceAnalysis, img: np.ndarray):
+    """
+    Returns a (512,) flip-averaged, L2-normalized embedding or None.
+    emb = avg(embedding(img), embedding(flipped_img))
+    """
+    faces = app.get(img)
+    if len(faces) != 1:
+        return None
+    emb = faces[0].normed_embedding
+    if emb is None or emb.size == 0:
+        return None
+
+    img_flip = cv2.flip(img, 1)
+    faces_flip = app.get(img_flip)
+    if faces_flip:
+        emb_flip = faces_flip[0].normed_embedding
+        if emb_flip is not None and emb_flip.size > 0:
+            emb = (emb + emb_flip) / 2.0
+
+    return emb.astype(np.float32)
 
 def register_user(name: str, shots: int = 50, delay: float = 0.25, ctx_id: int = 0):
     user_dir = os.path.join(USERS_DIR, name)
@@ -44,7 +62,6 @@ def register_user(name: str, shots: int = 50, delay: float = 0.25, ctx_id: int =
             break
 
         faces = app.get(frame)
-        
         if faces:
             f = faces[0]
             x1, y1, x2, y2 = map(int, f.bbox)
@@ -78,7 +95,6 @@ def register_user(name: str, shots: int = 50, delay: float = 0.25, ctx_id: int =
     else:
         print("[WARN] No images were captured, database not updated.")
 
-
 def _face_paths():
     user_dirs = [d for d in glob.glob(os.path.join(USERS_DIR, "*")) if os.path.isdir(d)]
     for udir in user_dirs:
@@ -87,33 +103,40 @@ def _face_paths():
             yield name, img_path
 
 def build_database(ctx_id: int = 0):
-    
+
     app = _load_app(ctx_id=ctx_id)
     db = {}
     total_images = 0
 
+    # collect per-image embeddings
     for name, img_path in _face_paths():
         img = cv2.imread(img_path)
         if img is None:
             continue
-        faces = app.get(img)
-        
-        if len(faces) != 1:
-            continue
-        emb = faces[0].normed_embedding  
-        if emb is None or emb.size == 0:
+        emb = _embed_image(app, img)       
+        if emb is None:
             continue
 
         if name not in db:
-            db[name] = {"all_encodings": [], "embedding": None, "count": 0}
-        db[name]["all_encodings"].append(emb.astype(np.float32))
+            db[name] = {"all_encodings": [], "centroids": [], "embedding": None, "count": 0}
+        db[name]["all_encodings"].append(emb)
         db[name]["count"] += 1
         total_images += 1
 
+    # cluster per user to create multiple centroids (handles "multiple looks")
     for name, rec in db.items():
-        arr = np.vstack(rec["all_encodings"])  
-        rec["embedding"] = arr.mean(axis=0)    
-        print(f"[DB] {name}: {arr.shape[0]} images -> 512-d mean embedding")
+        arr = np.vstack(rec["all_encodings"]) 
+        k = 3 if arr.shape[0] >= 30 else (2 if arr.shape[0] >= 15 else 1)
+        if k == 1:
+            centroids = [arr.mean(axis=0)]
+        else:
+            km = KMeans(n_clusters=k, n_init=10, random_state=42)
+            labels = km.fit_predict(arr)
+            centroids = [arr[labels == i].mean(axis=0) for i in range(k)]
+
+        rec["centroids"] = centroids
+        rec["embedding"] = arr.mean(axis=0)     
+        print(f"[DB] {name}: {arr.shape[0]} images -> {len(centroids)} centroid(s)")
 
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(DB_FILE, "wb") as f:
@@ -136,50 +159,53 @@ def _update_single_user_in_db(app: FaceAnalysis, user_name: str):
     """
     After registering a user, compute embeddings for that user's folder and
     update the database immediately (without rebuilding everyone).
+      - flip-averaged per-image embeddings
+      - cluster per-user into centroids (1..3)
     """
     user_dir = os.path.join(USERS_DIR, user_name)
     if not os.path.isdir(user_dir):
         print(f"[WARN] No folder found for '{user_name}'")
         return
 
-    db = _load_db()  # load existing DB if present
+    db = _load_db() 
     all_vecs = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
         for img_path in glob.glob(os.path.join(user_dir, ext)):
             img = cv2.imread(img_path)
             if img is None:
                 continue
-            faces = app.get(img)
-            if len(faces) != 1:
-                continue
-            emb = faces[0].normed_embedding
-            if emb is None or emb.size == 0:
-                continue
-            all_vecs.append(emb.astype(np.float32))
+            emb = _embed_image(app, img)       
+            if emb is not None:
+                all_vecs.append(emb)
 
     if not all_vecs:
         print(f"[WARN] No valid faces found for '{user_name}' — database not updated.")
         return
 
     arr = np.vstack(all_vecs)
-    mean_vec = arr.mean(axis=0)
+    k = 3 if arr.shape[0] >= 30 else (2 if arr.shape[0] >= 15 else 1)
+    if k == 1:
+        centroids = [arr.mean(axis=0)]
+    else:
+        km = KMeans(n_clusters=k, n_init=10, random_state=42)
+        labels = km.fit_predict(arr)
+        centroids = [arr[labels == i].mean(axis=0) for i in range(k)]
+
     db[user_name] = {
         "all_encodings": all_vecs,
-        "embedding": mean_vec,
+        "centroids": centroids,            
+        "embedding": arr.mean(axis=0),     
         "count": len(all_vecs),
     }
     _save_db(db)
     print(f"[INFO] Database updated automatically for '{user_name}' ({len(all_vecs)} images).")
 
-
 def _cosine_sim_matrix(A, b):
-    
     A = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
     b = b / (np.linalg.norm(b) + 1e-8)
     return A @ b
 
 def train_svm():
-    
     db = _load_db()
     if not db:
         print("[ERROR] No database found. Run: python main.py build-db")
@@ -195,8 +221,8 @@ def train_svm():
         return
 
     X = np.array(X, dtype=np.float32)
-    base = LinearSVC()  # linear is all you need with ArcFace embeddings
-    clf = CalibratedClassifierCV(base, cv=5)  # probability calibration
+    base = LinearSVC()  
+    clf = CalibratedClassifierCV(base, cv=5) 
     clf.fit(X, y)
     joblib.dump(clf, SVM_FILE)
     print(f"[INFO] Trained SVM on {len(X)} samples across {len(set(y))} users -> {SVM_FILE}")
@@ -205,14 +231,13 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
     """
     Live recognition using InsightFace embeddings.
     If an SVM model exists, use it with probability threshold for 'Unknown'.
-    Otherwise, fall back to cosine similarity vs. per-user means.
+    Otherwise, fall back to cosine similarity vs. per-user **centroids** (multi-look).
     """
     db = _load_db()
     if not db:
         print("[ERROR] No database found. Run: python main.py build-db")
         return
 
-    # Try to load SVM (optional)
     clf = None
     if os.path.exists(SVM_FILE):
         try:
@@ -222,9 +247,16 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
         except Exception as e:
             print(f"[WARN] Failed to load SVM ({e}). Falling back to cosine matching.")
 
-    # Prepare fallback centroid matrix
-    names_centroid = list(db.keys())
-    centroids = np.stack([db[n]["embedding"] for n in names_centroid], axis=0)  # (U,512)
+    names_flat, centroids = [], []
+    for uname, rec in db.items():
+        c_list = rec.get("centroids") or [rec["embedding"]]
+        for c in c_list:
+            names_flat.append(uname)
+            centroids.append(c)
+    if not centroids:
+        print("[ERROR] No centroids available in DB.")
+        return
+    centroids = np.stack(centroids, axis=0) 
 
     app = _load_app(ctx_id=ctx_id)
     cap = cv2.VideoCapture(0)
@@ -252,12 +284,11 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
                     label_text = pred
                     color = (0,255,0) if pred != "Unknown" else (0,0,255)
                 else:
-                    # cosine similarity fallback to user centroids
+                    # cosine similarity vs. ALL centroids (multi-look support)
                     sims = _cosine_sim_matrix(centroids, emb)   # higher is better
                     best_idx = int(np.argmax(sims))
                     score = float(sims[best_idx])
-                    # A typical good start threshold for cosine is around 0.60
-                    pred = names_centroid[best_idx] if score >= thresh_unknown else "Unknown"
+                    pred = names_flat[best_idx] if score >= thresh_unknown else "Unknown"
                     label_text = pred
                     color = (0,255,0) if pred != "Unknown" else (0,0,255)
 
@@ -300,9 +331,6 @@ def delete_user(name: str):
     os.rmdir(udir)
     print(f"[INFO] Deleted user '{name}'. Now rebuild the DB: python main.py build-db")
 
-# -------------------------
-# CLI wiring (same commands)
-# -------------------------
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Face recognition app (InsightFace under the hood)")
     sub = ap.add_subparsers(dest="cmd")
@@ -316,13 +344,11 @@ if __name__ == "__main__":
     bd = sub.add_parser("build-db", help="Build or update the embeddings database")
     bd.add_argument("--cpu", action="store_true", help="Force CPU (ctx_id = -1)")
 
-    # Kept the same 'recognize' entry point, but now supports SVM if trained
     rc = sub.add_parser("recognize", help="Live recognition")
     rc.add_argument("--thresh", type=float, default=0.60, help="Unknown threshold (prob/cosine)")
     rc.add_argument("--no-score", action="store_true", help="Hide score numbers")
     rc.add_argument("--cpu", action="store_true", help="Force CPU (ctx_id = -1)")
 
-    # New but optional: train an SVM (you can ignore if you want cosine-only)
     sv = sub.add_parser("train-svm", help="Train SVM on stored embeddings")
 
     ls = sub.add_parser("list", help="List registered users")

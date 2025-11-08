@@ -158,7 +158,7 @@ def update_user_in_db(app: FaceAnalysis, user_name: str):
 
 # -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="Face ID (InsightFace)", layout="centered")
-st.title("Face Recognition Demo (InsightFace)")
+st.title("Face Recognition App")
 st.caption(f"Data directory: {DATA_DIR}")
 st.caption("Register users → Database updates automatically → Recognize in real time")
 

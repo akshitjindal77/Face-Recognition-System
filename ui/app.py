@@ -1,10 +1,10 @@
 import os, time, glob, pickle
 from pathlib import Path
-
 import cv2
 import numpy as np
 import streamlit as st
 import joblib
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # InsightFace (detector + alignment + ArcFace embeddings)
 from insightface.app import FaceAnalysis

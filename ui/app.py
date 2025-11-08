@@ -4,6 +4,11 @@ import cv2
 import numpy as np
 import streamlit as st
 import joblib
+
+# New: WebRTC imports
+import av
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # InsightFace (detector + alignment + ArcFace embeddings)
@@ -50,14 +55,6 @@ def delete_user(name: str):
             udir.rmdir()
         except OSError:
             pass
-
-def ensure_cam(index=0, width=640, height=480):
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    return cap
 
 @st.cache_resource(show_spinner=False)
 def load_face_app(ctx_id: int):
@@ -164,7 +161,6 @@ st.caption("Register users → Database updates automatically → Recognize in r
 
 with st.sidebar:
     st.header("Controls")
-    cam_index = st.number_input("Camera index", min_value=0, max_value=10, value=0, step=1)
     use_cpu = st.checkbox("Force CPU (uncheck for GPU if available)", value=True)
     ctx_id = -1 if use_cpu else 0
 
@@ -193,6 +189,94 @@ with st.sidebar:
 
 tab1, tab2, tab3 = st.tabs(["Register", "Database (optional)", "Recognize"])
 
+# -------------------- WebRTC Processors --------------------
+class RegistrationTransformer(VideoTransformerBase):
+    def __init__(self, app: FaceAnalysis, user_dir: Path, shots: int, delay_s: float):
+        self.app = app
+        self.user_dir = user_dir
+        self.target = int(shots)
+        self.delay_s = float(delay_s)
+        self.taken = 0
+        self.last = 0.0
+        self.done = False
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        if self.done:
+            # Just pass-through once finished
+            img = frame.to_ndarray(format="bgr24")
+            draw_label(img, f"Captured {self.taken}/{self.target} - finished", 10, 30, (0, 200, 255))
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        bgr = frame.to_ndarray(format="bgr24")
+        faces = self.app.get(bgr)
+
+        if faces:
+            f = faces[0]
+            x1, y1, x2, y2 = map(int, f.bbox)
+            color = (0, 255, 0)
+            cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
+            draw_label(bgr, f"Capturing {self.taken+1}/{self.target}", x1, max(20, y1-10), color)
+
+            now = time.time()
+            if self.taken < self.target and (now - self.last) >= self.delay_s:
+                pad = 40
+                h, w = bgr.shape[:2]
+                px1 = max(0, x1 - pad); py1 = max(0, y1 - pad)
+                px2 = min(w, x2 + pad); py2 = min(h, y2 + pad)
+                face_crop = bgr[py1:py2, px1:px2]
+                if face_crop.size > 0:
+                    out_path = self.user_dir / f"{int(now*1000)}.jpg"
+                    cv2.imwrite(str(out_path), face_crop)
+                    self.taken += 1
+                    self.last = now
+
+                if self.taken >= self.target:
+                    self.done = True
+                    draw_label(bgr, "Capture complete ✅", 10, 60, (0, 200, 255))
+        else:
+            draw_label(bgr, "No face detected", 10, 30, (0, 0, 255))
+
+        return av.VideoFrame.from_ndarray(bgr, format="bgr24")
+
+
+class RecognitionTransformer(VideoTransformerBase):
+    def __init__(self, app: FaceAnalysis, names, centroids, clf, classes, thresh: float):
+        self.app = app
+        self.names = names
+        self.centroids = centroids
+        self.clf = clf
+        self.classes = classes
+        self.thresh = float(thresh)
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        bgr = frame.to_ndarray(format="bgr24")
+        faces = self.app.get(bgr)
+
+        for f in faces:
+            x1, y1, x2, y2 = map(int, f.bbox)
+            emb = f.normed_embedding
+            label = "Unknown"; score = 0.0; color = (0, 0, 255)
+            if emb is not None and emb.size > 0:
+                if self.clf is not None:
+                    probs = self.clf.predict_proba([emb])[0]
+                    best_idx = int(np.argmax(probs))
+                    score = float(probs[best_idx])
+                    pred = self.classes[best_idx] if score >= self.thresh else "Unknown"
+                    label = pred
+                    color = (0, 255, 0) if pred != "Unknown" else (0, 0, 255)
+                elif self.centroids is not None and len(self.names) > 0:
+                    sims = cosine_sim_matrix(self.centroids, emb)
+                    best_idx = int(np.argmax(sims))
+                    score = float(sims[best_idx])
+                    pred = self.names[best_idx] if score >= self.thresh else "Unknown"
+                    label = pred
+                    color = (0, 255, 0) if pred != "Unknown" else (0, 0, 255)
+
+            cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
+            draw_label(bgr, f"{label} ({score:.2f})", x1, max(20, y1 - 10), color)
+
+        return av.VideoFrame.from_ndarray(bgr, format="bgr24")
+
 # ------------- Tab 1: Register -------------
 with tab1:
     st.subheader("Register a new user")
@@ -202,8 +286,11 @@ with tab1:
     with colB:
         do_delete = st.checkbox("Delete user first (if exists)", value=False)
 
-    start_reg = st.button("Start capture")
-    ph = st.empty()
+    # Buttons/state
+    if "reg_db_updated_for" not in st.session_state:
+        st.session_state.reg_db_updated_for = None
+
+    start_reg = st.button("Start live capture")
     status = st.empty()
 
     if start_reg:
@@ -213,53 +300,33 @@ with tab1:
             user_dir = USERS_DIR / name.strip()
             if do_delete and user_dir.exists():
                 delete_user(name.strip())
-                user_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                user_dir.mkdir(parents=True, exist_ok=True)
-
+            user_dir.mkdir(parents=True, exist_ok=True)
             face_app = load_face_app(ctx_id)
-            cap = ensure_cam(cam_index)
-            if cap is None:
-                st.error("Camera could not be opened. Try a different index or check permissions.")
-            else:
-                taken = 0
-                last = time.time()
-                st.info("Center your face in the green box; keep gentle pose/lighting changes.")
-                while taken < shots:
-                    ok, frame = cap.read()
-                    if not ok:
-                        status.error("Camera read failed")
-                        break
 
-                    faces = face_app.get(frame)
-                    if faces:
-                        f = faces[0]
-                        x1, y1, x2, y2 = map(int, f.bbox)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        draw_label(frame, f"Capturing {taken+1}/{shots}", x1, y1 - 10)
+            webrtc_ctx = webrtc_streamer(
+                key="register",
+                mode=WebRtcMode.SENDRECV,
+                media_stream_constraints={"video": True, "audio": False},
+                video_transformer_factory=lambda: RegistrationTransformer(
+                    app=face_app,
+                    user_dir=user_dir,
+                    shots=shots,
+                    delay_s=delay,
+                ),
+            )
 
-                        if (time.time() - last) >= delay:
-                            pad = 40
-                            h, w = frame.shape[:2]
-                            px1 = max(0, x1 - pad); py1 = max(0, y1 - pad)
-                            px2 = min(w, x2 + pad); py2 = min(h, y2 + pad)
-                            face_crop = frame[py1:py2, px1:px2]
-                            if face_crop.size > 0:
-                                out_path = user_dir / f"{int(time.time()*1000)}.jpg"
-                                cv2.imwrite(str(out_path), face_crop)
-                                taken += 1
-                                last = time.time()
-
-                    draw_label(frame, "Close tab or wait to finish.", 10, 30, (0, 200, 255))
-                    ph.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-
-                cap.release()
-                if taken > 0:
-                    status.success(f"Saved {taken} images to {user_dir}. Updating database automatically...")
-                    with st.spinner("Computing embeddings and updating database..."):
-                        update_user_in_db(face_app, name.strip())
-                else:
-                    status.warning("No images captured. Database not updated.")
+            # Poll transformer state to update DB once done
+            if webrtc_ctx and webrtc_ctx.state.playing:
+                st.info("Center your face in the green box; gentle pose/lighting changes help.")
+                # Small hint to refresh UI
+                st.caption("The capture will auto-save crops until it reaches the requested shots.")
+                if webrtc_ctx.video_transformer:
+                    vt = webrtc_ctx.video_transformer
+                    if getattr(vt, "done", False) and st.session_state.reg_db_updated_for != name:
+                        with st.spinner("Computing embeddings and updating database..."):
+                            update_user_in_db(face_app, name.strip())
+                        st.session_state.reg_db_updated_for = name
+                        status.success(f"Saved {vt.taken} images to {user_dir} and updated DB.")
 
 # ------------- Tab 2: Database (optional) -------------
 with tab2:
@@ -275,81 +342,36 @@ with tab2:
 # ------------- Tab 3: Recognize -------------
 with tab3:
     st.subheader("Live Recognition")
-    col1, col2 = st.columns(2)
-    with col1:
-        start_rec = st.button("Start recognition")
-    with col2:
-        stop_rec = st.button("Stop recognition")
 
-    if "recognizing" not in st.session_state:
-        st.session_state.recognizing = False
+    db = load_db()
+    if not db:
+        st.error("No database found. Register users and/or rebuild it in the 'Database' tab.")
+    else:
+        names = list(db.keys())
+        centroids = np.stack([db[n]["embedding"] for n in names], axis=0) if names else None
 
-    if start_rec:
-        st.session_state.recognizing = True
-    if stop_rec:
-        st.session_state.recognizing = False
+        clf = None
+        classes = None
+        if SVM_FILE.exists():
+            try:
+                clf = joblib.load(SVM_FILE)
+                classes = clf.classes_
+                st.info("Using SVM model with probability thresholding.")
+            except Exception as e:
+                st.warning(f"Failed to load SVM ({e}). Falling back to cosine similarity.")
 
-    out = st.empty()
-    note = st.empty()
-
-    if st.session_state.recognizing:
-        db = load_db()
-        if not db:
-            st.error("No database found. Build it in the 'Database' tab.")
-        else:
-            names = list(db.keys())
-            centroids = np.stack([db[n]["embedding"] for n in names], axis=0) if names else None
-
-            clf = None
-            classes = None
-            if SVM_FILE.exists():
-                try:
-                    clf = joblib.load(SVM_FILE)
-                    classes = clf.classes_
-                    st.info("Using SVM model with probability thresholding.")
-                except Exception as e:
-                    st.warning(f"Failed to load SVM ({e}). Falling back to cosine similarity.")
-
-            face_app = load_face_app(ctx_id)
-            cap = ensure_cam(cam_index)
-            if cap is None:
-                st.error("Camera could not be opened. Try a different index or check permissions.")
-            else:
-                note.info("Press 'Stop recognition' to end.")
-                while st.session_state.recognizing:
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
-
-                    faces = face_app.get(frame)
-                    for f in faces:
-                        x1, y1, x2, y2 = map(int, f.bbox)
-                        emb = f.normed_embedding
-                        label = "Unknown"
-                        score = 0.0
-                        color = (0, 0, 255)
-
-                        if emb is not None and emb.size > 0:
-                            if clf is not None:
-                                probs = clf.predict_proba([emb])[0]
-                                best_idx = int(np.argmax(probs))
-                                score = float(probs[best_idx])
-                                pred = classes[best_idx] if score >= thresh else "Unknown"
-                                label = pred
-                                color = (0, 255, 0) if pred != "Unknown" else (0, 0, 255)
-                            elif centroids is not None and len(names) > 0:
-                                sims = cosine_sim_matrix(centroids, emb)
-                                best_idx = int(np.argmax(sims))
-                                score = float(sims[best_idx])
-                                pred = names[best_idx] if score >= thresh else "Unknown"
-                                label = pred
-                                color = (0, 255, 0) if pred != "Unknown" else (0, 0, 255)
-
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        draw_label(frame, f"{label} ({score:.2f})", x1, y1 - 10, color)
-
-                    out.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-                    time.sleep(0.01)
-
-                cap.release()
-                note.info("Stopped.")
+        face_app = load_face_app(ctx_id)
+        webrtc_streamer(
+            key="recognize",
+            mode=WebRtcMode.SENDRECV,
+            media_stream_constraints={"video": True, "audio": False},
+            video_transformer_factory=lambda: RecognitionTransformer(
+                app=face_app,
+                names=names,
+                centroids=centroids,
+                clf=clf,
+                classes=classes,
+                thresh=thresh,
+            ),
+        )
+        st.caption("If video is blank on mobile, ensure camera permissions are granted and try Safari/Chrome.")

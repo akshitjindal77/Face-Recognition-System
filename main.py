@@ -8,7 +8,7 @@ import joblib
 from insightface.app import FaceAnalysis
 from sklearn.svm import LinearSVC
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.cluster import KMeans  
+from sklearn.cluster import KMeans
 
 DATA_DIR   = os.path.join("data")
 USERS_DIR  = os.path.join(DATA_DIR, "users")
@@ -52,7 +52,11 @@ def register_user(name: str, shots: int = 50, delay: float = 0.25, ctx_id: int =
     os.makedirs(user_dir, exist_ok=True)
 
     app = _load_app(ctx_id=ctx_id)
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
     taken = 0
     print(f"[INFO] Registering '{name}'. Look at the camera. Capturing {shots} face images...")
     while taken < shots:
@@ -66,7 +70,7 @@ def register_user(name: str, shots: int = 50, delay: float = 0.25, ctx_id: int =
             f = faces[0]
             x1, y1, x2, y2 = map(int, f.bbox)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-            _draw_label(frame, f"Capturing {taken+1}/{shots}", x1, y1-10)
+            _draw_label(frame, f"Capturing {taken+1}/{shots}", x1, max(20, y1-10))
             pad = 20
             h, w = frame.shape[:2]
             px1 = max(0, x1 - pad); py1 = max(0, y1 - pad)
@@ -103,7 +107,6 @@ def _face_paths():
             yield name, img_path
 
 def build_database(ctx_id: int = 0):
-
     app = _load_app(ctx_id=ctx_id)
     db = {}
     total_images = 0
@@ -113,7 +116,7 @@ def build_database(ctx_id: int = 0):
         img = cv2.imread(img_path)
         if img is None:
             continue
-        emb = _embed_image(app, img)       
+        emb = _embed_image(app, img)
         if emb is None:
             continue
 
@@ -125,7 +128,7 @@ def build_database(ctx_id: int = 0):
 
     # cluster per user to create multiple centroids (handles "multiple looks")
     for name, rec in db.items():
-        arr = np.vstack(rec["all_encodings"]) 
+        arr = np.vstack(rec["all_encodings"])
         k = 3 if arr.shape[0] >= 30 else (2 if arr.shape[0] >= 15 else 1)
         if k == 1:
             centroids = [arr.mean(axis=0)]
@@ -135,7 +138,7 @@ def build_database(ctx_id: int = 0):
             centroids = [arr[labels == i].mean(axis=0) for i in range(k)]
 
         rec["centroids"] = centroids
-        rec["embedding"] = arr.mean(axis=0)     
+        rec["embedding"] = arr.mean(axis=0)
         print(f"[DB] {name}: {arr.shape[0]} images -> {len(centroids)} centroid(s)")
 
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -167,14 +170,14 @@ def _update_single_user_in_db(app: FaceAnalysis, user_name: str):
         print(f"[WARN] No folder found for '{user_name}'")
         return
 
-    db = _load_db() 
+    db = _load_db()
     all_vecs = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
         for img_path in glob.glob(os.path.join(user_dir, ext)):
             img = cv2.imread(img_path)
             if img is None:
                 continue
-            emb = _embed_image(app, img)       
+            emb = _embed_image(app, img)
             if emb is not None:
                 all_vecs.append(emb)
 
@@ -193,8 +196,8 @@ def _update_single_user_in_db(app: FaceAnalysis, user_name: str):
 
     db[user_name] = {
         "all_encodings": all_vecs,
-        "centroids": centroids,            
-        "embedding": arr.mean(axis=0),     
+        "centroids": centroids,
+        "embedding": arr.mean(axis=0),
         "count": len(all_vecs),
     }
     _save_db(db)
@@ -221,8 +224,8 @@ def train_svm():
         return
 
     X = np.array(X, dtype=np.float32)
-    base = LinearSVC()  
-    clf = CalibratedClassifierCV(base, cv=5) 
+    base = LinearSVC()
+    clf = CalibratedClassifierCV(base, cv=5)
     clf.fit(X, y)
     joblib.dump(clf, SVM_FILE)
     print(f"[INFO] Trained SVM on {len(X)} samples across {len(set(y))} users -> {SVM_FILE}")
@@ -239,11 +242,16 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
         return
 
     clf = None
+    classes = None
     if os.path.exists(SVM_FILE):
         try:
             clf = joblib.load(SVM_FILE)
-            classes = clf.classes_
-            print(f"[INFO] Using SVM model: {SVM_FILE}")
+            if hasattr(clf, "predict_proba"):
+                classes = clf.classes_
+                print(f"[INFO] Using SVM model: {SVM_FILE}")
+            else:
+                print("[WARN] Loaded SVM has no predict_proba; using cosine matching.")
+                clf = None
         except Exception as e:
             print(f"[WARN] Failed to load SVM ({e}). Falling back to cosine matching.")
 
@@ -256,10 +264,14 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
     if not centroids:
         print("[ERROR] No centroids available in DB.")
         return
-    centroids = np.stack(centroids, axis=0) 
+    centroids = np.stack(centroids, axis=0)
 
     app = _load_app(ctx_id=ctx_id)
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
     print("[INFO] Recognizing... Press 'q' to quit.")
     while True:
         ok, frame = cap.read()
@@ -284,7 +296,6 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
                     label_text = pred
                     color = (0,255,0) if pred != "Unknown" else (0,0,255)
                 else:
-                    # cosine similarity vs. ALL centroids (multi-look support)
                     sims = _cosine_sim_matrix(centroids, emb)   # higher is better
                     best_idx = int(np.argmax(sims))
                     score = float(sims[best_idx])
@@ -296,7 +307,7 @@ def recognize_live(thresh_unknown: float = 0.60, show_score: bool = True, ctx_id
             text = f"{label_text}"
             if show_score:
                 text += f" ({score:.2f})"
-            _draw_label(frame, text, x1, y1-10, color)
+            _draw_label(frame, text, x1, max(20, y1-10), color)
 
         _draw_label(frame, "Press 'q' to quit", 10, 30, (200,200,0))
         cv2.imshow("Recognize", frame)
@@ -322,7 +333,6 @@ def delete_user(name: str):
     if not os.path.isdir(udir):
         print(f"[ERROR] User '{name}' not found.")
         return
-    # delete files
     for p in glob.glob(os.path.join(udir, "*")):
         try:
             os.remove(p)
@@ -349,9 +359,10 @@ if __name__ == "__main__":
     rc.add_argument("--no-score", action="store_true", help="Hide score numbers")
     rc.add_argument("--cpu", action="store_true", help="Force CPU (ctx_id = -1)")
 
-    sv = sub.add_parser("train-svm", help="Train SVM on stored embeddings")
+    sub.add_parser("train-svm", help="Train SVM on stored embeddings")
 
-    ls = sub.add_parser("list", help="List registered users")
+    sub.add_parser("list", help="List registered users")
+
     dl = sub.add_parser("delete", help="Delete a user and their images")
     dl.add_argument("--name", required=True)
 

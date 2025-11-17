@@ -4,15 +4,24 @@ import cv2
 import numpy as np
 import streamlit as st
 import joblib
-
-# New: WebRTC imports
 import av
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoTransformerBase
+
+from streamlit_webrtc import (
+    webrtc_streamer,
+    WebRtcMode,
+    VideoProcessorBase,
+    RTCConfiguration,
+)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # InsightFace (detector + alignment + ArcFace embeddings)
 from insightface.app import FaceAnalysis
+
+# -------------------- WebRTC config --------------------
+RTC_CONFIG = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 # -------------------- Config & paths --------------------
 BASE_DIR  = Path(__file__).parent.resolve()
@@ -44,6 +53,7 @@ def list_users():
     return sorted([p.name for p in USERS_DIR.iterdir() if p.is_dir()])
 
 def delete_user(name: str):
+    # remove images on disk
     udir = USERS_DIR / name
     if udir.is_dir():
         for p in udir.glob("*"):
@@ -55,6 +65,11 @@ def delete_user(name: str):
             udir.rmdir()
         except OSError:
             pass
+    # also prune from DB if present
+    db = load_db()
+    if name in db:
+        db.pop(name, None)
+        save_db(db)
 
 @st.cache_resource(show_spinner=False)
 def load_face_app(ctx_id: int):
@@ -120,12 +135,10 @@ def update_user_in_db(app: FaceAnalysis, user_name: str):
     udir = USERS_DIR / user_name
     if not udir.is_dir():
         st.warning(f"No folder found for user {user_name}")
-        return
+        return False
 
     db = load_db()
     all_vecs = []
-    total = 0
-
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
         for img_path in udir.glob(ext):
             img = cv2.imread(str(img_path))
@@ -138,7 +151,6 @@ def update_user_in_db(app: FaceAnalysis, user_name: str):
             if emb is None or emb.size == 0:
                 continue
             all_vecs.append(emb.astype(np.float32))
-            total += 1
 
     if all_vecs:
         arr = np.vstack(all_vecs)
@@ -149,9 +161,11 @@ def update_user_in_db(app: FaceAnalysis, user_name: str):
             "count": len(all_vecs),
         }
         save_db(db)
-        st.success(f"✅ Database updated automatically for '{user_name}' ({len(all_vecs)} images).")
+        st.success(f"Database updated automatically for '{user_name}' ({len(all_vecs)} images).")
+        return True
     else:
         st.warning(f"No valid faces found for '{user_name}'. Try re-registering.")
+        return False
 
 # -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="Face ID (InsightFace)", layout="centered")
@@ -190,7 +204,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["Register", "Database (optional)", "Recognize"])
 
 # -------------------- WebRTC Processors --------------------
-class RegistrationTransformer(VideoTransformerBase):
+class RegistrationProcessor(VideoProcessorBase):
     def __init__(self, app: FaceAnalysis, user_dir: Path, shots: int, delay_s: float):
         self.app = app
         self.user_dir = user_dir
@@ -202,7 +216,6 @@ class RegistrationTransformer(VideoTransformerBase):
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         if self.done:
-            # Just pass-through once finished
             img = frame.to_ndarray(format="bgr24")
             draw_label(img, f"Captured {self.taken}/{self.target} - finished", 10, 30, (0, 200, 255))
             return av.VideoFrame.from_ndarray(img, format="bgr24")
@@ -232,14 +245,14 @@ class RegistrationTransformer(VideoTransformerBase):
 
                 if self.taken >= self.target:
                     self.done = True
-                    draw_label(bgr, "Capture complete ✅", 10, 60, (0, 200, 255))
+                    draw_label(bgr, "Capture complete", 10, 60, (0, 200, 255))
         else:
             draw_label(bgr, "No face detected", 10, 30, (0, 0, 255))
 
         return av.VideoFrame.from_ndarray(bgr, format="bgr24")
 
 
-class RecognitionTransformer(VideoTransformerBase):
+class RecognitionProcessor(VideoProcessorBase):
     def __init__(self, app: FaceAnalysis, names, centroids, clf, classes, thresh: float):
         self.app = app
         self.names = names
@@ -286,47 +299,87 @@ with tab1:
     with colB:
         do_delete = st.checkbox("Delete user first (if exists)", value=False)
 
-    # Buttons/state
+    # session state to keep WebRTC component alive across reruns
     if "reg_db_updated_for" not in st.session_state:
         st.session_state.reg_db_updated_for = None
+    if "reg_running" not in st.session_state:
+        st.session_state.reg_running = False
+    if "reg_active_name" not in st.session_state:
+        st.session_state.reg_active_name = ""
 
     start_reg = st.button("Start live capture")
+    stop_reg = st.button("Stop capture")
     status = st.empty()
 
+    # Handle start/stop buttons
     if start_reg:
         if not name.strip():
             st.error("Please enter a name")
+            st.session_state.reg_running = False
         else:
-            user_dir = USERS_DIR / name.strip()
+            clean_name = name.strip()
+            st.session_state.reg_active_name = clean_name
+            user_dir = USERS_DIR / clean_name
             if do_delete and user_dir.exists():
-                delete_user(name.strip())
+                delete_user(clean_name)
             user_dir.mkdir(parents=True, exist_ok=True)
+            st.session_state.reg_running = True
+            st.session_state.reg_db_updated_for = None
+            status.info("Starting camera... if prompted, allow browser camera access.")
+
+    if stop_reg:
+        st.session_state.reg_running = False
+
+    webrtc_ctx = None
+    active_name = st.session_state.get("reg_active_name", "").strip()
+    if st.session_state.reg_running and active_name:
+        user_dir = USERS_DIR / active_name
+        user_dir.mkdir(parents=True, exist_ok=True)
+        face_app = load_face_app(ctx_id)
+
+        webrtc_ctx = webrtc_streamer(
+            key="register",
+            mode=WebRtcMode.SENDRECV,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 1280},
+                    "height": {"ideal": 720},
+                    "frameRate": {"ideal": 30},
+                },
+                "audio": False,
+            },
+            rtc_configuration=RTC_CONFIG,
+            async_processing=True,  # smoother with heavy inference
+            video_processor_factory=lambda: RegistrationProcessor(
+                app=face_app,
+                user_dir=user_dir,
+                shots=shots,
+                delay_s=delay,
+            ),
+        )
+
+        # Poll processor state to update DB once capture done
+        if webrtc_ctx and webrtc_ctx.state.playing:
+            st.info("Center your face in the green box; gentle pose/lighting changes help.")
+            st.caption("The capture will auto-save crops until it reaches the requested shots.")
+            vp = webrtc_ctx.video_processor
+            # On each rerun, if finished once, update DB (only once per name)
+            if vp and getattr(vp, "done", False) and st.session_state.reg_db_updated_for != active_name:
+                with st.spinner("Computing embeddings and updating database..."):
+                    if update_user_in_db(face_app, active_name):
+                        st.session_state.reg_db_updated_for = active_name
+                        status.success(f"Saved {vp.taken} images to {user_dir} and updated DB.")
+                    else:
+                        status.warning("Capture finished, but no valid faces detected in saved images.")
+
+    # Manual fail-safe
+    if st.button("Finalize & Update DB (if capture finished)"):
+        active_name = st.session_state.get("reg_active_name", "").strip() or name.strip()
+        if not active_name:
+            st.warning("Please enter a user name and start a capture first.")
+        else:
             face_app = load_face_app(ctx_id)
-
-            webrtc_ctx = webrtc_streamer(
-                key="register",
-                mode=WebRtcMode.SENDRECV,
-                media_stream_constraints={"video": True, "audio": False},
-                video_transformer_factory=lambda: RegistrationTransformer(
-                    app=face_app,
-                    user_dir=user_dir,
-                    shots=shots,
-                    delay_s=delay,
-                ),
-            )
-
-            # Poll transformer state to update DB once done
-            if webrtc_ctx and webrtc_ctx.state.playing:
-                st.info("Center your face in the green box; gentle pose/lighting changes help.")
-                # Small hint to refresh UI
-                st.caption("The capture will auto-save crops until it reaches the requested shots.")
-                if webrtc_ctx.video_transformer:
-                    vt = webrtc_ctx.video_transformer
-                    if getattr(vt, "done", False) and st.session_state.reg_db_updated_for != name:
-                        with st.spinner("Computing embeddings and updating database..."):
-                            update_user_in_db(face_app, name.strip())
-                        st.session_state.reg_db_updated_for = name
-                        status.success(f"Saved {vt.taken} images to {user_dir} and updated DB.")
+            update_user_in_db(face_app, active_name)
 
 # ------------- Tab 2: Database (optional) -------------
 with tab2:
@@ -355,8 +408,12 @@ with tab3:
         if SVM_FILE.exists():
             try:
                 clf = joblib.load(SVM_FILE)
-                classes = clf.classes_
-                st.info("Using SVM model with probability thresholding.")
+                if hasattr(clf, "predict_proba"):
+                    classes = clf.classes_
+                    st.info("Using SVM model with probability thresholding.")
+                else:
+                    st.warning("Loaded SVM has no predict_proba; using cosine similarity.")
+                    clf = None
             except Exception as e:
                 st.warning(f"Failed to load SVM ({e}). Falling back to cosine similarity.")
 
@@ -364,8 +421,17 @@ with tab3:
         webrtc_streamer(
             key="recognize",
             mode=WebRtcMode.SENDRECV,
-            media_stream_constraints={"video": True, "audio": False},
-            video_transformer_factory=lambda: RecognitionTransformer(
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 1280},
+                    "height": {"ideal": 720},
+                    "frameRate": {"ideal": 30},
+                },
+                "audio": False,
+            },
+            rtc_configuration=RTC_CONFIG,
+            async_processing=True,
+            video_processor_factory=lambda: RecognitionProcessor(
                 app=face_app,
                 names=names,
                 centroids=centroids,

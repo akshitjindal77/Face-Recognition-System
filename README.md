@@ -1,4 +1,6 @@
 # Face Recognition Tool (InsightFace + Streamlit)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://face-recognition-system-aki.streamlit.app/)
+
 
 A **multi-user face recognition system** built with **InsightFace**, **OpenCV**, and **Streamlit**.  
 It lets you register faces, build an embedding database, train an optional classifier (SVM), and recognize users in real time — all locally.
